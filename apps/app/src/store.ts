@@ -45,7 +45,12 @@ import type {
 import { DEFAULT_TERMINAL_THEME, type TerminalThemeId } from '@zana-ai/zcc-domain/terminal-themes';
 import { seedPromptArgs } from '@zana-ai/zcc-domain/launch-provider';
 import type { UsageSummary } from '@zana-ai/zcc-domain/telemetry-events';
-import { resolveRestartProfile } from './lib/sessionRestore.js';
+import {
+  resolveRestartProfile,
+  readTitleGuards,
+  syncTitleGuards,
+  applyTitleGuards
+} from './lib/sessionRestore.js';
 import { closeFollowupProgressMessage, runCloseIdleAgents } from './lib/close-idle-agents.js';
 
 import { getScopedProjectId, isScopedWindow } from './lib/windowScope.js';
@@ -1468,6 +1473,10 @@ export interface ClosedTab {
   cwd?: string;
   /** Re-pin on reopen if the closed tab was pinned. */
   pinned?: boolean;
+  /** Rename guards — carried through so reopen doesn't drop a manual/auto title (see restartTerminal). */
+  titleLocked?: boolean;
+  autoTitledByLlm?: boolean;
+  autoTitledByOsc?: boolean;
 }
 
 interface DataState {
@@ -2422,12 +2431,20 @@ export const useData = create<DataState>((set, get) => ({
       // they have live ptys, so restore must skip them (else we'd risk double-
       // spawning on top of an invisible running session).
       const hydrationFailed = new Set<string>();
+      // Main's own TerminalSession never carries titleLocked/autoTitledBy{Llm,Osc}
+      // (renderer-only) and its title is frozen at spawn time — so a plain
+      // reload (Cmd+R) that re-hydrates straight from main would silently
+      // revert every renamed/auto-named tab. Re-apply the persisted, id-keyed
+      // guard map (see syncTitleGuards) onto each hydrated session to undo that.
+      const titleGuards = readTitleGuards();
       await Promise.all(
         projects.map(async (p) => {
           try {
             const sessions = await product.terminals.list(p.id);
             if (sessions.length > 0) {
-              set((s) => ({ terminals: { ...s.terminals, [p.id]: sessions } }));
+              set((s) => ({
+                terminals: { ...s.terminals, [p.id]: applyTitleGuards(sessions, titleGuards) }
+              }));
             }
           } catch {
             /* couldn't read this project's live terminals — skip it on restore */
@@ -3322,7 +3339,10 @@ export const useData = create<DataState>((set, get) => ({
           title: closing.title,
           extraArgs: closing.extraArgs,
           cwd: closing.cwd,
-          pinned: closing.pinned
+          pinned: closing.pinned,
+          titleLocked: closing.titleLocked,
+          autoTitledByLlm: closing.autoTitledByLlm,
+          autoTitledByOsc: closing.autoTitledByOsc
         });
         if (stack.length > 10) stack.splice(0, stack.length - 10);
       }
@@ -3653,11 +3673,34 @@ export const useData = create<DataState>((set, get) => ({
         const cur = s.terminals[projectId] || [];
         const without = cur.filter((t) => t.id !== sessionId && t.id !== created!.id);
         const target = Math.min(idx, without.length);
-        const restored = { ...created!, pinned: src.pinned };
+        const restored = {
+          ...created!,
+          pinned: src.pinned,
+          titleLocked: src.titleLocked || created!.titleLocked,
+          autoTitledByLlm: src.autoTitledByLlm || created!.autoTitledByLlm,
+          autoTitledByOsc: src.autoTitledByOsc || created!.autoTitledByOsc
+        };
         const next = without.slice(0, target).concat(restored, without.slice(target));
         return { terminals: { ...s.terminals, [projectId]: next } };
       });
       useUi.getState().selectTab(projectId, created.id);
+      // The old sessionId is retired — this drops its guard entry and, if the
+      // source had one, persists it under the fresh id so a later reload can
+      // still re-apply it (see restartTerminal's other branch below).
+      syncTitleGuards(
+        allLiveSessionIds(),
+        src.titleLocked || src.autoTitledByLlm || src.autoTitledByOsc
+          ? {
+              id: created.id,
+              entry: {
+                title: src.title,
+                titleLocked: src.titleLocked,
+                autoTitledByLlm: src.autoTitledByLlm,
+                autoTitledByOsc: src.autoTitledByOsc
+              }
+            }
+          : undefined
+      );
       return created;
     }
     // Snapshot what we need before kill/reset — once we close the pty the
@@ -3674,7 +3717,10 @@ export const useData = create<DataState>((set, get) => ({
       claudeSessionId: src.claudeSessionId,
       codexSessionId: src.codexSessionId,
       openCodeSessionId: src.openCodeSessionId,
-      nativeConversationId: src.nativeConversationId
+      nativeConversationId: src.nativeConversationId,
+      titleLocked: src.titleLocked,
+      autoTitledByLlm: src.autoTitledByLlm,
+      autoTitledByOsc: src.autoTitledByOsc
     };
     try {
       if (!await product.terminals.close(sessionId)) {
@@ -3723,11 +3769,34 @@ export const useData = create<DataState>((set, get) => ({
       if (!created2) return s;
       const without = cur.filter((t) => t.id !== created.id);
       const target = Math.min(idx, without.length);
-      const restored = { ...created2, pinned: snapshot.pinned };
+      const restored = {
+        ...created2,
+        pinned: snapshot.pinned,
+        titleLocked: snapshot.titleLocked || created2.titleLocked,
+        autoTitledByLlm: snapshot.autoTitledByLlm || created2.autoTitledByLlm,
+        autoTitledByOsc: snapshot.autoTitledByOsc || created2.autoTitledByOsc
+      };
       const next = without.slice(0, target).concat(restored, without.slice(target));
       return { terminals: { ...s.terminals, [projectId]: next } };
     });
     useUi.getState().selectTab(projectId, created.id);
+    // The old sessionId is retired — this drops its guard entry (it's no
+    // longer in allLiveSessionIds()) and, if the source had a guard, persists
+    // it under the fresh id so a later reload can still re-apply it.
+    syncTitleGuards(
+      allLiveSessionIds(),
+      snapshot.titleLocked || snapshot.autoTitledByLlm || snapshot.autoTitledByOsc
+        ? {
+            id: created.id,
+            entry: {
+              title: snapshot.title,
+              titleLocked: snapshot.titleLocked,
+              autoTitledByLlm: snapshot.autoTitledByLlm,
+              autoTitledByOsc: snapshot.autoTitledByOsc
+            }
+          }
+        : undefined
+    );
     return created;
   },
 
@@ -3806,6 +3875,22 @@ export const useData = create<DataState>((set, get) => ({
     useSubagentChildren.getState().clear(sessionId);
     useCatchUpSummary.getState().clear(sessionId);
     useUi.getState().selectTab(projectId, created.id);
+    // See restartTerminal — retire the old tombstone's guard entry and, if it
+    // had one, re-key it onto the fresh id so a later reload still finds it.
+    syncTitleGuards(
+      allLiveSessionIds(),
+      snapshot.titleLocked || snapshot.autoTitledByLlm || snapshot.autoTitledByOsc
+        ? {
+            id: created.id,
+            entry: {
+              title: snapshot.title,
+              titleLocked: snapshot.titleLocked,
+              autoTitledByLlm: snapshot.autoTitledByLlm,
+              autoTitledByOsc: snapshot.autoTitledByOsc
+            }
+          }
+        : undefined
+    );
     return created;
   },
 
@@ -3828,6 +3913,44 @@ export const useData = create<DataState>((set, get) => ({
     if (created && top.pinned) {
       get().setPinned(projectId, created.id, true);
     }
+    // Re-apply the rename guards so a reopened tab keeps its name (mirrors the
+    // relaunch session-restore fix): a manual rename (titleLocked) or a
+    // one-shot auto-name (autoTitledBy{Llm,Osc}) must survive the close/reopen
+    // round-trip, else the next idle-title push clobbers it.
+    if (created && (top.titleLocked || top.autoTitledByLlm || top.autoTitledByOsc)) {
+      set((s) => ({
+        terminals: {
+          ...s.terminals,
+          [projectId]: (s.terminals[projectId] ?? []).map((t) =>
+            t.id === created.id
+              ? {
+                  ...t,
+                  titleLocked: top.titleLocked || t.titleLocked,
+                  autoTitledByLlm: top.autoTitledByLlm || t.autoTitledByLlm,
+                  autoTitledByOsc: top.autoTitledByOsc || t.autoTitledByOsc
+                }
+              : t
+          )
+        }
+      }));
+    }
+    // See restartTerminal — persist the guard under the newly-created id (or
+    // just prune, if the closed tab never had one) so a later reload can
+    // still find it.
+    syncTitleGuards(
+      allLiveSessionIds(),
+      created && (top.titleLocked || top.autoTitledByLlm || top.autoTitledByOsc)
+        ? {
+            id: created.id,
+            entry: {
+              title: top.title,
+              titleLocked: top.titleLocked,
+              autoTitledByLlm: top.autoTitledByLlm,
+              autoTitledByOsc: top.autoTitledByOsc
+            }
+          }
+        : undefined
+    );
     return created;
   },
 
@@ -3880,6 +4003,11 @@ export const useData = create<DataState>((set, get) => ({
         }
       };
     });
+    // Also persist under the session's own id so a plain reload (Cmd+R) can
+    // re-apply the rename onto main's re-hydrated live session (see
+    // applyTitleGuards) — hydration is order-agnostic and deliberately skips
+    // re-deriving this for already-live projects on reload.
+    syncTitleGuards(allLiveSessionIds(), { id: sessionId, entry: { title, titleLocked: true } });
   },
 
   autoTitleTerminal(sessionId, title, source = 'osc') {
@@ -3916,6 +4044,16 @@ export const useData = create<DataState>((set, get) => ({
         )
       }
     }));
+    // See renameTerminal — an auto-name is also a guard a plain reload must
+    // not drop.
+    syncTitleGuards(allLiveSessionIds(), {
+      id: sessionId,
+      entry: {
+        title: next,
+        autoTitledByLlm: source === 'llm' ? true : tab.autoTitledByLlm,
+        autoTitledByOsc: source === 'osc' ? true : tab.autoTitledByOsc
+      }
+    });
   },
 
   markExited(sessionId, exitCode) {
@@ -4014,5 +4152,10 @@ export const useData = create<DataState>((set, get) => ({
   }
 }));
 
+/** Every session id currently live across all projects, for syncTitleGuards'
+ *  pruning set (see the store's rename/auto-title/restart/reopen call sites). */
+function allLiveSessionIds(): string[] {
+  return Object.values(useData.getState().terminals).flatMap((list) => list.map((t) => t.id));
+}
 
 export * from './stores/live.js';

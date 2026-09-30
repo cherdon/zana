@@ -1,5 +1,6 @@
-import type { LaunchProfileId } from '@zana-ai/zcc-domain/product';
+import type { LaunchProfileId, TerminalSession } from '@zana-ai/zcc-domain/product';
 import { isClaudeProfile, isCodexProfile, isOpenCodeProfile } from '@zana-ai/zcc-domain/launch-provider';
+import { readLocalStorageItem, writeLocalStorageItem } from './safe-local-storage.js';
 
 /**
  * Restart helpers for an already-open tab.
@@ -162,4 +163,81 @@ export function resolveRestartProfile(
     extraArgs: withResumeArgs(profile, cleanArgs, claudeSessionId),
     resumeSessionId: undefined
   };
+}
+
+const TITLE_GUARD_KEY = 'zcc.titleGuards';
+
+/**
+ * A plain renderer reload (Cmd+R / DevTools reload) wipes the renderer's
+ * in-memory zustand store but not main's live ptys — hydration re-fetches
+ * sessions straight from main's own TerminalSession records, which never
+ * carry titleLocked/autoTitledBy{Llm,Osc} (renderer-only) and whose title is
+ * frozen at spawn time. Without this, a reload silently reverts every
+ * renamed/auto-named tab. This map is id-keyed (not the order-based cold-start
+ * snapshot) so it matches directly against the id main hands back on a warm
+ * reload, where the pty and session id are unchanged.
+ */
+export interface TitleGuardEntry {
+  title: string;
+  titleLocked?: boolean;
+  autoTitledByLlm?: boolean;
+  autoTitledByOsc?: boolean;
+}
+
+export type TitleGuardMap = Record<string, TitleGuardEntry>;
+
+/** Read the title-guard map from localStorage. Returns {} on any error. */
+export function readTitleGuards(): TitleGuardMap {
+  const raw = readLocalStorageItem(TITLE_GUARD_KEY);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as TitleGuardMap) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Write the title-guard map to localStorage. Swallows quota/serialization errors. */
+export function writeTitleGuards(guards: TitleGuardMap): void {
+  writeLocalStorageItem(TITLE_GUARD_KEY, JSON.stringify(guards));
+}
+
+/**
+ * Upsert one session's guard (rename, auto-title, or a restart/reopen/
+ * reconnect that carried a guard onto a freshly-minted id) and drop every
+ * entry whose id isn't in `liveIds`, so the map self-prunes to the current
+ * live session set instead of growing across the app's lifetime.
+ */
+export function syncTitleGuards(
+  liveIds: Iterable<string>,
+  upsert?: { id: string; entry: TitleGuardEntry }
+): void {
+  const keep = new Set(liveIds);
+  if (upsert) keep.add(upsert.id);
+  const guards = readTitleGuards();
+  const next: TitleGuardMap = {};
+  for (const id of keep) {
+    if (upsert && id === upsert.id) next[id] = upsert.entry;
+    else if (guards[id]) next[id] = guards[id];
+  }
+  writeTitleGuards(next);
+}
+
+/**
+ * Re-apply persisted guards onto freshly-hydrated live sessions, matched by
+ * id. Sessions with no persisted guard pass through unchanged.
+ */
+export function applyTitleGuards(sessions: TerminalSession[], guards: TitleGuardMap): TerminalSession[] {
+  return sessions.map((session) => {
+    const guard = guards[session.id];
+    if (!guard) return session;
+    return {
+      ...session,
+      title: guard.title,
+      titleLocked: guard.titleLocked || session.titleLocked,
+      autoTitledByLlm: guard.autoTitledByLlm || session.autoTitledByLlm,
+      autoTitledByOsc: guard.autoTitledByOsc || session.autoTitledByOsc
+    };
+  });
 }
